@@ -3,8 +3,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 import torchvision as tv
-import torchvision.transforms.functional as TF
+import torch.nn.functional as F
+from scipy.optimize import linear_sum_assignment  # pip install scipy
 from torchvision.models import resnet50, ResNet50_Weights
+from tqdm import tqdm
 
 class SyntheticDetection(Dataset):
     """
@@ -181,10 +183,176 @@ class DetectionTransformer(nn.Module):
         decoder_outputs = self.decoder_blocks(encoder_outputs, mask)
         pred_logits, pred_boxes = self.heads(decoder_outputs)
         return pred_logits, pred_boxes
-    
+
+class SimpleHungarianLoss(nn.Module):
+    def __init__(self, num_classes=1, no_object_weight=0.1, lambda_box=5.0):
+        super().__init__()
+        self.num_classes = num_classes                # K
+        self.no_object_class = num_classes            # index K = "no-object"
+        self.lambda_box = lambda_box
+
+        # weights for CE: downweight "no-object"
+        ce_weight = torch.ones(num_classes + 1)
+        ce_weight[self.no_object_class] = no_object_weight
+        self.register_buffer("ce_weight", ce_weight)
+
+    @torch.no_grad()
+    def hungarian_match(self, pred_logits, pred_boxes, targets):
+        """
+        Returns list of (idx_pred, idx_tgt) for each image in batch.
+        """
+        B, Q, _ = pred_logits.shape
+        prob = pred_logits.softmax(-1)  # (B,Q,K+1)
+
+        matches = []
+        for b in range(B):
+            tgt_labels = targets[b]["labels"]  # (M,)
+            tgt_boxes  = targets[b]["boxes"]   # (M,4)
+            M = tgt_boxes.shape[0]
+
+            if M == 0:
+                matches.append((torch.empty(0, dtype=torch.long),
+                                torch.empty(0, dtype=torch.long)))
+                continue
+
+            # cost_class[q,m] = -P(class = tgt_labels[m])
+            cost_class = -prob[b][:, tgt_labels]              # (Q,M)
+
+            # cost_bbox[q,m] = L1(pred_box[q], tgt_box[m])
+            cost_bbox = torch.cdist(pred_boxes[b], tgt_boxes, p=1)  # (Q,M)
+
+            C = cost_class + self.lambda_box * cost_bbox
+            C = C.cpu()
+
+            i, j = linear_sum_assignment(C)
+            matches.append((torch.tensor(i, dtype=torch.long),
+                            torch.tensor(j, dtype=torch.long)))
+        return matches
+
+    def forward(self, pred_logits, pred_boxes, targets):
+        """
+        pred_logits: (B,Q,K+1)
+        pred_boxes:  (B,Q,4)
+        targets: list of dicts
+        """
+        device = pred_logits.device
+        B, Q, _ = pred_logits.shape
+
+        matches = self.hungarian_match(pred_logits, pred_boxes, targets)
+
+        # ---- Classification targets for ALL queries ----
+        # default every query is "no-object"
+        target_classes = torch.full((B, Q), self.no_object_class, dtype=torch.long, device=device)
+
+        # fill matched queries with GT labels
+        for b, (idx_q, idx_t) in enumerate(matches):
+            if idx_q.numel() == 0:
+                continue
+            target_classes[b, idx_q] = targets[b]["labels"][idx_t].to(device)
+
+        # CE over (B,Q)
+        loss_ce = F.cross_entropy(
+            pred_logits.transpose(1, 2),  # (B,K+1,Q)
+            target_classes,
+            weight=self.ce_weight
+        )
+
+        # ---- Box L1 only on matched pairs ----
+        src_boxes = []
+        tgt_boxes = []
+        for b, (idx_q, idx_t) in enumerate(matches):
+            if idx_q.numel() == 0:
+                continue
+            src_boxes.append(pred_boxes[b, idx_q])
+            tgt_boxes.append(targets[b]["boxes"][idx_t].to(device))
+
+        if len(src_boxes) == 0:
+            loss_box = pred_boxes.sum() * 0.0
+        else:
+            src_boxes = torch.cat(src_boxes, 0)
+            tgt_boxes = torch.cat(tgt_boxes, 0)
+            loss_box = F.l1_loss(src_boxes, tgt_boxes)
+
+        loss_total = loss_ce + self.lambda_box * loss_box
+
+        return loss_total, {"loss_ce": loss_ce.detach(), "loss_box": loss_box.detach()}
+
+def move_targets(targets, device):
+    out = []
+    for t in targets:
+        out.append({
+            "boxes": t["boxes"].to(device),
+            "labels": t["labels"].to(device),
+        })
+    return out
+
+def train(model, train_loader, epochs=3, lr=1e-4, device=None):
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    criterion = SimpleHungarianLoss(num_classes=1, no_object_weight=0.1, lambda_box=5.0).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total = 0.0
+        print(f"Epoch : {epoch}")
+        for step, (images, targets) in enumerate(tqdm(train_loader)):
+            images = images.to(device)
+            targets = move_targets(targets, device)
+
+            pred_logits, pred_boxes = model(images)
+
+            loss, logs = criterion(pred_logits, pred_boxes, targets)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total += float(loss.detach().cpu())
+
+            if (step + 1) % 50 == 0:
+                avg = total / (step + 1)
+                print(f"epoch {epoch} step {step+1}: loss={avg:.4f} "
+                      f"(ce={float(logs['loss_ce']):.4f}, box={float(logs['loss_box']):.4f})")
+
+        print(f"Epoch {epoch} done. avg loss={total / (step + 1):.4f}")
+
+    return model
+
+@torch.no_grad()
+def infer(model, images, score_thresh=0.7, device=None):
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    model.eval().to(device)
+
+    images = images.to(device)
+    pred_logits, pred_boxes = model(images)
+
+    prob = pred_logits.softmax(-1)          # (B,Q,2)
+    scores = prob[..., 0]                   # prob of "rect" class
+    keep = scores > score_thresh
+
+    results = []
+    B, Q, _ = pred_boxes.shape
+    for b in range(B):
+        results.append({
+            "scores": scores[b, keep[b]].cpu(),
+            "boxes":  pred_boxes[b, keep[b]].cpu(),  # normalized cxcywh
+        })
+    return results
+
 if __name__ == "__main__":
     images, targets = next(iter(train_loader))
     model = DetectionTransformer()
-    outputs = model(images)
+    model = train(model, train_loader, epochs=3, lr=1e-4)
+    
+    images, targets = next(iter(val_loader))
+    detections = infer(model, images, score_thresh=0.7)
+
+    print(detections[0]["scores"][:5])
+    print(detections[0]["boxes"][:5])
+
+    
+    
 
 
