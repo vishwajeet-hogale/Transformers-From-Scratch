@@ -115,7 +115,7 @@ class DeTREncoder(nn.Module):
         self.encoder = nn.TransformerEncoder(self.encoder_layer, num_layers = 4)
     def forward(self, image_tokens):
         outputs = self.encoder(image_tokens)
-        masks = torch.zeros(outputs.shape[0], 16)
+        masks = torch.zeros(outputs.shape[0], 16, device=outputs.device, dtype=torch.bool)
         return outputs, masks
     
 class DeTRDecoder(nn.Module):
@@ -286,8 +286,7 @@ def move_targets(targets, device):
         })
     return out
 
-def train(model, train_loader, epochs=3, lr=1e-4, device=None):
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+def train(model, train_loader, epochs=10, lr=1e-3, device=None):
     model.to(device)
 
     criterion = SimpleHungarianLoss(num_classes=1, no_object_weight=0.1, lambda_box=5.0).to(device)
@@ -341,10 +340,20 @@ def infer(model, images, score_thresh=0.7, device=None):
         })
     return results
 
+def get_device():
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
 if __name__ == "__main__":
     images, targets = next(iter(train_loader))
+
+    device = get_device()
     model = DetectionTransformer()
-    model = train(model, train_loader, epochs=3, lr=1e-4)
+    model = model.to(device)
+    model = train(model, train_loader, epochs=3, lr=1e-4, device=device)
     
     images, targets = next(iter(val_loader))
     detections = infer(model, images, score_thresh=0.7)
@@ -352,7 +361,6 @@ if __name__ == "__main__":
     print(detections[0]["scores"][:5])
     print(detections[0]["boxes"][:5])
 
-    
-    
+
 
 
